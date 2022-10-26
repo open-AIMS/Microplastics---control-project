@@ -1,0 +1,205 @@
+---
+title: "Control project - Comparing microplastics traits - index"
+author: "Marina Santana - modified from Rmd created by Diego R. Barneche"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    collapse: no
+    df_print: kable
+    fig_caption: yes
+    fig_height: 4
+    fig_width: 4
+    highlight: textmate
+    toc: yes
+    toc_float: yes
+    standalone: TRUE
+    theme: spacelab
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+csl: ../resources/ecollett.csl
+---
+
+<style type="text/css">
+h1.title {
+  font-size: 18pt;
+  color: #4682B4;
+  margin-top: 10px;
+  margin-bottom: 10px;
+}
+h1 { /* Header 1 */
+  font-size: 14pt;
+  color: #4682B4;
+  margin-bottom: 10px;
+}
+h2 { /* Header 2 */
+  font-size: 13pt;
+  color: #4682B4;
+  margin-bottom: 10px;
+}
+h3 { /* Header 3 */
+  font-size: 12pt;
+  color: #4682B4;
+  margin-bottom: 10px;
+}
+h5 { /* Header 5 */
+  font-size: 14px;
+  color: #666666;
+  display: inline;
+}
+</style>
+
+```{r setup, include = FALSE}
+require(knitr)
+opts_chunk$set(warning = FALSE, message = FALSE, fig.pos = "center")
+```
+
+<div style="margin-bottom:30px;">
+</div>
+
+# Introduction {.tabset .tabset-fade}
+
+This quick report aims to provide an overview on how to fit a simple test of means (as in control vs. treatment) for multiple types of microplastics (hereafter MP) traits. MP traits can be of various types, e.g. continuous (length of microplastic fragment), or categorical (type of polymer, colour, etc).
+
+Traditionally in the ecotox world researchers may want to discount the trace amount of contaminant from control samples in order to have an estimate of how much contaminant treatment samples might have. In the case of microplastics this can be tricky to implement because we do not know whether trace amounts of some trait in the control samples are at all present in the treatment samples. In that instance, applying the classic subtraction method would lead to negative values of the trait in question in the treatment samples.
+
+Here we propose an alternative way of going about it. By adopting a means test (i.e., similar to an ANOVA) while accounting for the appropriate statistical distribution of the response trait, we can focus instead on reporting how many fold (or similarly as percentage change) the control samples compare to the treatment samples. I will provide one example case for each type of variable, one continuous and another categorical.
+
+This particular dataset was produced by Amanda Dawson. She analysed 10 empty bottles which would normally be used to collect samples from the environment. These bottles however "naturally" contain some microplastics, and Amanda analysed those. She then randomly assigned three bottles to "Control" and another seven to "Sample" (i.e. treatment). This was done 12 times, each time being called an "iteration" which was recorded under a separate column in the dataset. For this particular analysis we will ignore that information, and assume that the dataset is mimicking a real scenario, i.e. recreate a `type` column assigning the first five bottles to `control` and the remaining five to `treatment`. Because we know a prior that these bottles are in theory identical, the expectation is that there is no difference between control and sample in any microplastic trait.
+
+Before we begin, we will need to load a series of packages for this report:
+
+```{r packages}
+library(readxl)
+library(plyr)
+library(dplyr)
+update.packages("dbplyr")
+library(purrr)
+library(DT)
+library(brms)
+library(ggplot2)
+library(patchwork)
+library(ggdist)
+library(tidybayes)
+library(emmeans)
+library(DHARMa)
+update.packages("DHARMa")
+
+```
+
+Then we read in the dataset to then explore the potential distributions of each variable.
+
+```{r dataraw, cache = TRUE}
+
+getwd()
+mp <- read_excel("Dawson_raw_control_data_final.xlsx", sheet = 1) %>%
+  mutate(type = ifelse(`Bottle name` %in% c("c1_a", "c1_b", "c1_c", "c2_a",
+                                            "c2_b"), "control", "treatment"))
+datatable(mp, width = "100%", options = list(scrollX = TRUE))
+```
+
+For the purposes of wrangling in R, I will also go ahead and clean the column names a bit (remove spaces, transform all to lower case, etc).
+
+```{r data, cache = TRUE, dependson = "dataraw"}
+mp <- mp %>%
+  mutate(across(where(is.character), tolower))
+names(mp) <- tolower(gsub(" ", "_", names(mp)))
+```
+
+## Continuous
+
+Length of fragment. This is a continuous variable ranging from `r min(mp$length)` to `r max(mp$length)` µm. So we can probably model it with a Gamma distribution, i.e. predictions have to be positive.
+
+(ref:fig-lengthhist) Distribution of observed fragment lengths.
+
+```{r lengthhist, fig.width = 6, fig.height = 5, fig.cap = "(ref:fig-lengthhist)", cache = TRUE, dependson = "data"}
+ggplot(data = mp) +
+  geom_histogram(mapping = aes(x = length), fill = "tomato", colour = "black") +
+  labs(x = substitute("Fragment length (" * mu * "m)")) +
+  theme_bw()
+```
+
+We can also see how it is distributed between control and treatment bottles:
+
+(ref:fig-lengthbp) Distribution of observed fragment lengths per bottle, coloured by bottle type (control vs. treatment).
+
+```{r lengthbp, fig.width = 8, fig.height = 6, fig.cap = "(ref:fig-lengthbp)", cache = TRUE, dependson = "data"}
+ggplot(data = mp) +
+  geom_boxplot(mapping = aes(y = length, x = bottle_name,
+                             fill = type)) +
+  labs(y = substitute("Fragment length (" * mu * "m)"), x = "Bottle ID") +
+  theme_bw()
+```
+
+Visually it seems that bottles are very similar in fragment length. However there is an outlier in bottle `c2_b` (an acrylic fiber). So, it seems sensible to remove this data point prior to fitting the [model](stats.html "Stats"), at least when modelling microplastics length.
+
+## Categorical
+
+Type of polymer. This is a categorical trait which describes the type of plastic polymer (e.g. polyacrylate, cellulose, PBTP), and probably the best way for us to visualise them is to check the number of fragments of each type in each bottle, or the proportion of each. We should model it using a multinomial model.
+
+(ref:fig-polybp) Proportion of different polymer type per bottle within types.
+
+```{r polybp, fig.width = 10, fig.height = 5, fig.cap = "(ref:fig-polybp)", cache = TRUE, dependson = "data"}
+mp %>%
+  group_by(type, bottle_name, grouping_polymer) %>%
+  dplyr:::summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(bottle_name) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(data = .) +
+    geom_bar(mapping = aes(y = proportion, x = bottle_name,
+                           fill = grouping_polymer), stat = "identity") +
+    facet_wrap(~ type, scales = "free") +
+    labs(y = "Proportion in bottle", x = "Bottle ID", fill = "Polymer") +
+    theme_bw()
+```
+
+They seem to vary quite a lot in proportion depending on the bottle. This will most likely influence the minimum number of bottles per type (control vs. treatment) one will need to robustly estimate differences (or the lack thereof) between types.
+
+We can also inspect average probability of occurrences between types for each polymer type---this is likely the best pre-visualization anyway because that will be the actual model evaluation.
+
+(ref:fig-polybp2) Average proportion of different polymers per bottle type.
+
+```{r polybp2, fig.width = 10, fig.height = 5, fig.cap = "(ref:fig-polybp2)", cache = TRUE, dependson = "data"}
+mp %>%
+  group_by(type, bottle_name, grouping_polymer) %>%
+  dplyr:::summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(bottle_name) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(data = .) +
+    geom_boxplot(mapping = aes(y = proportion, x = grouping_polymer)) +
+    facet_wrap(~ type) +
+    labs(y = "Proportion", x = "Polymer") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = -45, vjust = 0.5, hjust = 0))
+```
+
+# Next steps
+
+What follows will be based on the two variables described above.
+You can jump to the [next page](stats.html "Stats") to see the statistical
+analysis.
+
+<div style="margin-bottom:30px;">
+</div>
+
+# Reproducibility statement
+
+This webpage-like document was produced from markdown using knitr on 
+`r version$version.string` on a `r version$platform` system. It (the document, 
+not the raw data) is currently maintained under version control on a GitHub ==
+private [repository](https://www.github.com/open-AIMS/mp_traits "GitHub").
+
+The analyses above were produced in R with the following software versions:
+
+```{r, results = "markup"}
+sessionInfo()
+```

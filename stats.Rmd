@@ -1,0 +1,413 @@
+---
+title: "Control project - brm stats"
+author: "Marina Santana - modified from Rmd created by Diego R. Barneche"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    collapse: no
+    df_print: kable
+    fig_caption: yes
+    fig_height: 4
+    fig_width: 4
+    highlight: textmate
+    toc: yes
+    toc_float: yes
+    standalone: TRUE
+    theme: spacelab
+documentclass: article
+fontsize: 12pt
+mainfont: Arial
+mathfont: LiberationMono
+monofont: DejaVu Sans Mono
+classoption: a4paper
+bibliography: ../resources/references.bib
+csl: ../resources/ecollett.csl
+---
+
+<style type="text/css">
+h1.title {
+  font-size: 18pt;
+  color: #4682B4;
+  margin-top: 10px;
+  margin-bottom: 10px;
+}
+h1 { /* Header 1 */
+  font-size: 14pt;
+  color: #4682B4;
+  margin-bottom: 10px;
+}
+h2 { /* Header 2 */
+  font-size: 13pt;
+  color: #4682B4;
+  margin-bottom: 10px;
+}
+h3 { /* Header 3 */
+  font-size: 12pt;
+  color: #4682B4;
+  margin-bottom: 10px;
+}
+</style>
+
+```{r setup, include = FALSE}
+require(knitr)
+opts_chunk$set(warning = FALSE, message = FALSE, fig.pos = "center")
+```
+
+<div style="margin-bottom:30px;">
+</div>
+
+# Model fitting
+
+## Fragment length (continuous) {#cont}
+
+I did a series of explorations (not shown here) and found out that the model that yields the best behaved residuals and fit is a model that accounts for the interaction between microplastic length (µm) and shape (particle vs. fiber). This may seem reasonable in principle because fibres tend to be longer? I don't know, so I'll leave that to the microplastics experts. That said, this is already a somewhat heavily parametrised model because interactions tend to require [higher-than-standard sampling effort](https://statmodeling.stat.columbia.edu/2018/03/15/need-16-times-sample-size-estimate-interaction-estimate-main-effect/), and so the results from this exercise should be taken with a grain of salt and instead should be used as a guide to analyse future, much more comprehensive datasets.
+
+Because there are multiple measurements per bottle ID, I will add this variable as a grouping (a.k.a. random) variable. This will estimate the standard deviation of fragment length (on the natural log (link) scale) once we have accounted for the population-level (a.k.a. fixed) effects, in this case length and shape.
+
+We are fitting this using Bayesian statistics through the R package [`brms`](https://paul-buerkner.github.io/brms/index.html) [@burkner2017jss]. `brms` uses regular R formula syntax for generalised linear models, which simplifies our lives quite a lot. So in the code chunk below you will note that instead of fitting `length ~ ...` directly, I used the `brms` equivalent trick `length ~ 0 + Intercept + ...`, where `Intercept` is a special class of population-level effect that was introduced in the package so the user can check for the influence of the prior on the posterior (see more on this below). When the user fits a model with `length ~ ...`, then the prior on the global intercept cannot be checked against the posterior (package limitations). The argument `sample_prior = "yes"` just makes sure that the prior is exported with the object to the posteriors can be checked against them. After fitting the model, it is good practice to evaluate whether the priors are strongly influencing the posteriors.
+
+This is just an example case where we (the user) specify our own prior. By default, `brms` uses vaguely informative priors which generally have no bearing on the posterior distribution. The prior values are relevant on the link function scale. Because we are modelling this variable with a Gamma distribution and a log link, the values of the priors below will be on the natural log scale as well, apart from the Gamma distribution `shape` parameter. This is a lot of technical detail, I know, but it is the kind of pre-fitting treatment/considerations that one would have to demonstrate when submitting a peer-reviewed publication. I have chosen normal priors with a mean of 0 and standard deviation of 2 for the population-level effects (mean intercept and all the deviations from it), and gamma priors with a location 2 and inverse scale 1 for the group-level standard deviation and shape parameter.
+
+```{r lengthmodel, cache = TRUE, dependson = "data"}
+rstan::rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+mp_len <- mp %>%
+  filter(length < 4000) %>%
+  rename(polymer = grouping_polymer)
+
+my_priors <- prior(normal(0, 2), class = "b") +
+  prior(gamma(2, 1), class = "sd") +
+  prior(gamma(2, 1), class = "shape")
+
+options(mc.cores = parallel::detectCores())
+
+mod_len <- brm(length ~ 0 + Intercept + type * shape + (1 | bottle_name),
+               data = mp_len, family = Gamma(link = "log"), chains = 4,
+               cores = 4, iter = 1e4, prior = my_priors, sample_prior = "yes")
+```
+
+The model fitted fine without any convergence issues, which is already encouraging. We can do a series of checks to make sure that this model is an adequate fit to the data.
+
+### {.toc-ignore .unnumbered .tabset .tabset-pills}
+
+#### Model summary {.unnumbered}
+
+First we check the model summary:
+
+```{r cache = TRUE, dependson = "lengthmodel"}
+mod_len
+```
+
+Notice in the Group-level effects that the standard deviation was 0.28. Because this value is being estimated on the natural log scale, this implies that, on average, fragment sizes vary by `r round(exp(0.28 * 2), 2)`-fold (i.e. $e^{0.28 \times 2}$). The algorithm uses standard contrasts for its model matrix, so in the Population-level effects, the main Intercept is the average fragment length (on the natural log scale) for the reference level (chosen by alphabetical order): fibre in control bottle. The other parameters are deviations from it depending on whether the fragment is a particle and/or it belong to the treatment bottles.
+
+#### Posterior distributions and chains {.unnumbered}
+
+Then we look at the chains and posterior distributions:
+
+(ref:fig-lengthpost) Model output. Left column: posterior distribution of estimated parameters (on the natural log (link) scale); Right column: chain mixing.
+
+```{r lengthpost, fig.width = 6, fig.height = 8, fig.cap = "(ref:fig-lengthpost)", cache = TRUE, dependson = "lengthmodel"}
+
+plot(mod_len, N = 6)
+
+```
+
+#### Effect of priors {.unnumbered}
+
+As mentioned previously, in Bayesian statistics it is important to evaluate how much the prior belief influences the posterior distribution. We can do this by using the `hypothesis function`. We need to use the parameter names in the summary table.
+
+```{r lengthpriors, fig.width = 13, fig.height = 7, fig.cap = "(ref:fig-lengthpost)", cache = TRUE, dependson = "lengthmodel"}
+
+hyp_a <- plot(hypothesis(mod_len, "Intercept = 0", class = "b"),
+              plot = FALSE)[[1]] +
+  theme(legend.position = c(0.2, 0.8))
+hyp_b <- plot(hypothesis(mod_len, "typetreatment = 0", class = "b"),
+              plot = FALSE)[[1]] +
+  theme(legend.position = "none")
+hyp_c <- plot(hypothesis(mod_len, "shapeparticle = 0", class = "b"),
+              plot = FALSE)[[1]] +
+  theme(legend.position = "none")
+hyp_d <- plot(hypothesis(mod_len, "typetreatment:shapeparticle = 0",
+                         class = "b"), plot = FALSE)[[1]] +
+  theme(legend.position = "none")
+hyp_e <- plot(hypothesis(mod_len, "bottle_name__Intercept = 0", class = "sd"),
+              plot = FALSE)[[1]] +
+  theme(legend.position = "none")
+hyp_f <- plot(hypothesis(mod_len, "shape = 0", class = ""), plot = FALSE)[[1]] +
+  theme(legend.position = "none")
+(hyp_a + hyp_b + hyp_c) / (hyp_d + hyp_e + hyp_f)
+
+```
+
+As we can see the priors and the posteriors cover distinct regions which is reassuring, i.e. the model has estimated posterior distributions that are somewhat detached from the prior (here vague) belief.
+
+#### Model residuals {.unnumbered}
+
+!!!!!! We now use the [`DHARMa`](https://cran.r-project.org/web/packages/DHARMa/vignettes/DHARMa.html) package to look at the residuals.
+
+(ref:fig-lengthres) DHARMa residuals tests.
+
+```{r lengthres, fig.width = 10, fig.height = 5.5, fig.cap = "(ref:fig-lengthres)", cache = TRUE, dependson = "lengthmodel"}
+
+update.packages("dbplyr")
+source("../R/dharma_res.R")
+mod_preds_ <- posterior_predict(mod_len)
+mod_median_ <- apply(mod_preds_, 2, median)
+mod_res_ <- createDHARMa(
+  simulatedResponse = as.matrix(t(mod_preds_)),
+  observedResponse = mod_len$data$length,
+  fittedPredictedResponse = mod_median_, integerResponse = FALSE)
+gg_dharma(mod_res_, form = as.factor(mp_len$type))
+
+```
+
+They are not perfect, but they are well behaved.
+
+#### Posterior predictive checks {.unnumbered}
+
+We also plot some standard Bayesian posterior predictive checks (pp checks) to investigate how well the model replicates the overall distribution of the data. We can use many different visualisation types (see packages [`bayesplot`](https://mc-stan.org/bayesplot) and [`tidybayes`](http://mjskay.github.io/tidybayes/)). Here we will use just two standard pp checks: the density overlay and the predicted vs. observed.
+
+(ref:fig-lengthppcheck) Model output. Left plot: overlaid predicted densities (n = 300, thin red lines) over the observed density (single thick black line); Right plot: relationship between mean posterior prediction and observed raw data --- this is less recommended for models which only contain categorical predictors such as this one. Dashed line depicts a 1-to-1 fit.
+
+```{r lengthppcheck, fig.width = 10, fig.height = 4.5, fig.cap = "(ref:fig-lengthppcheck)", cache = TRUE, dependson = "lengthmodel"}
+
+pp_check_len_a <- pp_check(mod_len, type = "dens_overlay", ndraws = 300) +
+  theme(legend.position = c(0.8, 0.8)) +
+  labs(x = substitute("Fragment length (" * mu * "m)"),
+       y = "Density") +
+  scale_colour_manual(name = "", values = c("black", "tomato"),
+                      labels = c("Observed", "Predicted"))
+pp_check_len_b <- pp_check(mod_len, type = "scatter_avg") +
+  labs(x = substitute("Predicted fragment length (" * mu * "m)"),
+       y = substitute("Observed fragment length (" * mu * "m)"))
+pp_check_len_b$layers[[2]]$aes_params$colour <- "grey30"
+pp_check_len_b$layers[[2]]$aes_params$fill <- "grey60"
+pp_check_len_a + pp_check_len_b
+
+```
+
+### {.toc-ignore .unnumbered .tabset .tabset-pills}
+
+**Model predictions and fit to data**
+
+Overall the model does not explain great part of the variance. This is evidenced by the Bayesian *R^2^* [@gelman2019rsqrd] \
+not to be confused with the frequentist *R^2^*, see cited reference)
+
+```{r lengthmorsqrd, cache = TRUE, dependson = "lengthmodel"}
+
+bayes_R2(mod_len, summary = TRUE)
+
+```
+
+Considering that we are satisfied with the posterior distributions, chain mixing and residuals, we can now have a look at some posterior fits and also posterior predictive checks.
+
+(ref:fig-lengthcond) Model average predictions. Shaded smaller points are raw data, large point is model predicted mean, and error bars are Bayesian 95% credible intervals.
+
+```{r lengthcond, fig.width = 6, fig.height = 5.5, fig.cap = "(ref:fig-lengthcond)", cache = TRUE, dependson = "lengthmodel"}
+
+plot(conditional_effects(mod_len, effect = "type:shape"),
+     plot = FALSE)[[1]] +
+  geom_point(data = mp_len, mapping = aes(x = type, y = length, colour = shape),
+             position = position_jitterdodge(jitter.width = 0.1,
+                                             dodge.width = 0.4),
+             inherit.aes = FALSE, alpha = 0.5) +
+  theme_bw() +
+  labs(x = "Bottle type", y = substitute("Fragment length (" * mu * "m)"),
+       fill = "Shape: ", colour = "Shape: ") +
+  theme(legend.position = "bottom")
+  
+```
+
+**Calculating differences between bottle types**
+
+Now that we checked the basics of model validation and are satisfied with the model output, we can proceed to extract the differences between each of the groups. We first look at absolute differences between types of bottles (control - treatment) for each shape (particle vs. fibre).
+
+```{r lengthemmeansa, cache = TRUE, dependson = "lengthmodel"}
+em_tab_len_a <- emmeans(mod_len, ~ type | shape, point.est = median,
+                        level = .95) %>%
+  regrid %>%
+  pairs %>%
+  data.frame
+datatable(em_tab_len_a, width = "100%", options = list(scrollX = TRUE)) %>%
+  formatRound(columns = c("estimate", "lower.HPD", "upper.HPD"), digits = 2)
+```
+
+The above is indicating that, on average, treatment fibres are `r round(em_tab_len_a$estimate, 1)` µm larger than the control fibres. However, the 95% credible intervals overlap zero, so there is no real strong evidence of a difference, although note that some researchers may make that call on the basis of smaller credible intervals, such as 0.8 or 0.9. In any case, this is consistent with our expectation of no difference between control and treatment given that the bottles are in theory all the same. Similarly, for control particles there doesn't seem to exist any difference, with the mean being very close to 0 µm.
+
+We can also re-express the above values in terms of fold change:
+
+```{r lengthemmeansb, cache = TRUE, dependson = "lengthmodel"}
+emmeans(mod_len, pairwise ~ type | shape, point.est = median, level = .95,
+        type = "response")$contrasts %>%
+  data.frame %>%
+  datatable(width = "100%", options = list(scrollX = TRUE)) %>%
+  formatRound(columns = c("ratio", "lower.HPD", "upper.HPD"), digits = 2)
+```
+
+And we can also plot the posterior distribution of differences:
+
+(ref:fig-lengthdiffpost) Posterior distribution of differences between Control and Treatment bottles in terms of microplastic length for the different shapes (fibre, particle). Black point is the mean difference and horizontal error bars are respectively Bayesian 50% (thick) and 90% (thin) credible intervals.
+
+```{r lengthdiffpost, fig.width = 6, fig.height = 5.5, fig.cap = "(ref:fig-lengthdiffpost)", cache = TRUE, dependson = "lengthmodel"}
+
+emmeans(mod_len, ~ type | shape, point.est = median, level = .95) %>%
+  regrid %>%
+  pairs %>%
+  gather_emmeans_draws %>%
+    ggplot(data = .) +
+    stat_halfeye(mapping = aes(x = .value, fill = shape),
+                 alpha = 0.8, .width = c(.95, .5)) +
+    geom_vline(xintercept = 0, linetype = 2) +
+    labs(x = "Posterior difference (Control - Treatment)", y = "Density") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+
+
+```
+
+<div style="margin-bottom:30px;">
+</div>
+
+## Polymer class (Categorical)
+
+Here we don't exclude the length outlier because we are not so much interested in modelling length, but rather the probability of a fragment being of a particular polymer class.
+
+We will use a regression technique which allows us to model categorical response variables. You can read more about it [here](https://en.wikipedia.org/wiki/Categorical_distribution). For now all you need to know is that the model tries to estimate the probability of a particular fragment being of a polymer class. We will use default priors from `brms` here for simplicity.
+
+For now we will also simplify the approach used for the [continuous](#cont) case and remove the group-level effect attributable to bottle ID (I'll be investigating this a bit more because I hit a technical difficulty, but will try to update this report in the future if I can figure out a solution).
+
+```{r polymodel, cache = TRUE, dependson = "data"}
+
+mod_poly <- brm(grouping_polymer ~ type, data = mp, family = "categorical",
+                chains = 4, cores = 1, iter = 1e4, sample_prior = "yes")
+
+parallel::detectCores() 
+
+```
+
+Now make sure to follow what was done in the [previous example](#cont) for the model summary and posterior distributions. **NB** DHARMa residuals do not work with this type of model, so we need to make a call about fit using posterior predictive checks only.
+
+### {.toc-ignore .unnumbered .tabset .tabset-pills}
+
+#### Model summary {.unnumbered}
+
+First we check the model summary:
+
+```{r cache = TRUE, dependson = "polymodel"}
+mod_poly
+```
+
+This is a slightly complicated output; here we have odds ratios on the log scale --- see more info on how to interpret these models [here](https://discourse.mc-stan.org/t/interpreting-results-from-categorical-with-brm/4120). The output shows 11 population-level estimates even though we have 12 categories in total. That is because these are odds ratios relative to a reference category, which is chosen by default alphabetically (so in our case, acrylic).
+
+#### Posterior distributions and chains {.unnumbered}
+
+Then we look at the chains and posterior distributions:
+
+(ref:fig-polypost) Model output. Left column: posterior distribution of estimated parameters (on the logit (link) scale); Right column: chain mixing.
+
+```{r polypost, fig.width = 6, fig.height = 12, fig.cap = "(ref:fig-polypost)", cache = TRUE, dependson = "lengthmodel", fig.keep = "all"}
+
+
+plot(mod_poly, N = 11, ask = FALSE)
+
+
+```
+
+#### Posterior predictive checks {.unnumbered}
+
+There is one recommended posterior predictive check for categorical models, which simply overlays the predicted probability (and uncertainty) of each category per bottle type over each observed probability.
+
+(ref:fig-polyppcheck) Posterior predictive checks of relative frequency of occurrence of each polymer class per bottle type. Blue bars represent the observed proportions, black point is the mean predicted proportion and horizontal error bars depicts the Bayesian 95% credible intervals.
+
+```{r polyppcheck, fig.width = 7.9, fig.height = 5.1, fig.cap = "(ref:fig-polyppcheck)", cache = TRUE, dependson = "polymodel"}
+
+pp_check(mod_poly, type = "bars_grouped", group = "type", size = 0.8,
+         fatten = 1, prob = 0.95, ndraws = 300, freq = FALSE) +
+  labs(x = "Polymer class", y = "Probability of microplastic particle") +
+  scale_fill_manual("", values ="lightblue", labels = "Empirical data") +
+  scale_colour_manual("", values ="black", labels = "Model predictions") +
+  ylim(c(0, 1)) +
+  scale_x_discrete(limits = as.character(1:12),
+                   labels = sort(unique(mp$grouping_polymer))) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = -45, vjust = 0.5, hjust = 0),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"))
+
+```
+
+### {.toc-ignore .unnumbered .tabset .tabset-pills}
+
+**Calculating differences between bottle types**
+
+The code to calculate the differences is slightly more verbose than before, but here it is!
+
+```{r polydiff, cache = TRUE, dependson = "polymodel"}
+nd <- data.frame(grouping_polymer = "acrylic", type = c("control", "treatment"))
+predictions <- posterior_epred(mod_poly, newdata = nd, re_formula = NA)
+posterior_diffs <- vector(mode = "list", length = 12)
+names(posterior_diffs) <- sort(unique(mp$grouping_polymer))
+for (i in seq_len(dim(predictions)[3])) {
+  # control - treatment
+  # control / treatment
+  posterior_diffs[[i]] <- data.frame(
+    diff = predictions[, 1, i] - predictions[, 2, i],
+    ratio = predictions[, 1, i] / predictions[, 2, i]
+  )
+}
+posterior_diffs <- map_dfr(posterior_diffs, identity, .id = "grouping_polymer")
+```
+
+Which can wrangle to transform into summary tables of differences between Control and Treatment:
+
+(ref:fig-polydiffviza) Posterior distribution of differences in frequency of occurrence of microplastic polymer class between Control and Treatment bottles. Reference line depicts the 0 reference.
+
+```{r polydiffviza, fig.width = 7.9, fig.height = 5.1, fig.cap = "(ref:fig-polydiffviza)", cache = TRUE, dependson = "polydiff"}
+posterior_diffs %>%
+  group_by(grouping_polymer) %>%
+  mean_hdci(diff)
+
+ggplot(data = posterior_diffs) +
+  stat_halfeye(mapping = aes(x = diff), alpha = 0.8, .width = c(.95, .5)) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Posterior difference (Control - Treatment)", y = "Density") +
+  theme_bw() +
+  facet_wrap(~ grouping_polymer, scales = "free") +
+  theme(legend.position = "bottom")
+
+```
+
+Or ratios:
+
+(ref:fig-polydiffvizb) Posterior distribution of ratios (fold change) in frequency of occurrence of microplastic polymer class between Control and Treatment bottles. Reference line depicts the 1 reference. x axis spacing scales to the natural log.
+
+```{r polydiffvizb, fig.width = 7.9, fig.height = 5.1, fig.cap = "(ref:fig-polydiffvizb)", cache = TRUE, dependson = "polydiff"}
+posterior_diffs %>%
+  group_by(grouping_polymer) %>%
+  mean_hdci(ratio)
+
+ggplot(data = posterior_diffs) +
+  stat_halfeye(mapping = aes(x = ratio), alpha = 0.8, .width = c(.95, .5)) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  labs(x = "Posterior ratio (Control / Treatment)", y = "Density") +
+  theme_bw() +
+  scale_x_continuous(trans = "log") +
+  facet_wrap(~ grouping_polymer, scales = "free") +
+  theme(legend.position = "bottom")
+
+
+```
+
+Which overall indicates that some polymer types are exist at different proportions within each group of bottles, however note that the uncertainty is quite large!! The expectation is that the differences should be centred around 0, and the ratios around 1. The only polymer class which seems to be the very similar between bottle types is "semisynthetic". A much larger sample size should converge to that outcome. Figuring out what that exact sample size is supposed to be would require a formal power analysis.
+
+We can also extract the posterior probability of the difference being less or larger than 0 (expectation is that they should be pretty similar, i.e. mean is around 0), e.g.
+
+```{r polydiffprobs, cache=TRUE, dependson=}
+posterior_diffs %>%
+  group_by(grouping_polymer) %>%
+  summarise(prob_neg = sum(diff < 0) / n(), prob_pos = sum(diff > 0) / n())
+
+```
+
+# References

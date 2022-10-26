@@ -1,0 +1,203 @@
+---
+title: "Control project - brm stats continuity"
+author: "Marina Santana - based on Rmd stats created by Diego Barneche"
+date: '2022-03-04'
+output:
+  html_document: default
+  word_document: default
+---
+
+
+```{r setup, include = FALSE}
+require(knitr)
+opts_chunk$set(warning = FALSE, message = FALSE, fig.pos = "center")
+
+```
+
+<div style="margin-bottom:30px;">
+</div>
+## Colour class (Categorical)
+
+Type of colour This is a categorical trait which describes the type of plastic colour (e.g. blue, white, red), and probably the best way for us to visualise them is to check the number of fragments of each type in each bottle, or the proportion of each. We should model it using a multinomial model.
+
+(ref:fig-colourbp) Proportion of different colour type per bottle within types.
+
+```{r colourbp, fig.width = 10, fig.height = 5, fig.cap = "(ref:fig-colourbp)", cache = TRUE, dependson = "data"}
+mp %>%
+  group_by(type, bottle_name, colour) %>%
+  dplyr:::summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(bottle_name) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(data = .) +
+    geom_bar(mapping = aes(y = proportion, x = bottle_name,
+                           fill = colour), stat = "identity") +
+    facet_wrap(~ type, scales = "free") +
+    labs(y = "Proportion in bottle", x = "Bottle ID", fill = "Colour") +
+    theme_bw()
+```
+
+They seem to vary quite a lot in proportion depending on the bottle. This will most likely influence the minimum number of bottles per type (control vs. treatment) one will need to robustly estimate differences (or the lack thereof) between types.
+
+We can also inspect average probability of occurrences between types for each colour type ---this is likely the best pre-visualization anyway because that will be the actual model evaluation.
+
+(ref:fig-colourbp2) Average proportion of different colours per bottle type.
+
+```{r colourbp2, fig.width = 10, fig.height = 5, fig.cap = "(ref:fig-colourbp2)", cache = TRUE, dependson = "data"}
+mp %>%
+  group_by(type, bottle_name, colour) %>%
+  dplyr:::summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(bottle_name) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup() %>%
+  ggplot(data = .) +
+    geom_boxplot(mapping = aes(y = proportion, x = colour)) +
+    facet_wrap(~ type) +
+    labs(y = "Proportion", x = "Colour") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = -45, vjust = 0.5, hjust = 0))
+```
+## Model colour class (Categorical)
+
+Here we don't exclude the length outlier because we are not so much interested in modelling length, but rather the probability of a fragment being of a particular colour class.
+
+We will keep on using the regression technique applied by Diego on the analysis for polymer class, which allows us to model categorical response variables. For now all you need to know is that the model tries to estimate the probability of a particular fragment being of a colour class. We will use default priors from `brms` here for simplicity.
+
+As this is a replication of Diego's analysis, the group-level effect attributable to bottle ID was removed because of technical difficulties he faced abd did not figure out a solution.
+
+```{r colourmodel1, cache = TRUE, dependson = "data"}
+
+mod_colour <- brm(colour ~ type, data = mp, family = "categorical",
+                chains = 4, cores = 1, iter = 1e4, sample_prior = "yes")
+
+```
+
+Now make sure to follow what was done in the [previous example](#cont) for the model summary and posterior distributions. **NB** DHARMa residuals do not work with this type of model, so we need to make a call about fit using posterior predictive checks only.
+
+### {.toc-ignore .unnumbered .tabset .tabset-pills}
+
+#### Model summary {.unnumbered}
+
+First we check the model summary:
+
+```{r cache = TRUE, dependson = "colourmodel"}
+
+mod_colour
+
+```
+
+This is a slightly complicated output; here we have odds ratios on the log scale --- see more info on how to interpret these models [here](https://discourse.mc-stan.org/t/interpreting-results-from-categorical-with-brm/4120). The output shows 11 population-level estimates even though we have 12 categories in total. That is because these are odds ratios relative to a reference category, which is chosen by default alphabetically.
+
+#### Posterior distributions and chains {.unnumbered}
+
+Then we look at the chains and posterior distributions:
+
+(ref:fig-colourmodel) Model output. Left column: posterior distribution of estimated parameters (on the logit (link) scale); Right column: chain mixing.
+
+```{r colourmodel2, fig.width = 6, fig.height = 12, fig.cap = "(ref:fig-colourmodel)", cache = TRUE, dependson = "colourmodel", fig.keep = "all"}
+
+plot(mod_colour, N = 9, ask = FALSE)
+
+```
+
+#### Posterior predictive checks {.unnumbered}
+
+There is one recommended posterior predictive check for categorical models, which simply overlays the predicted probability (and uncertainty) of each category per bottle type over each observed probability.
+
+(ref:fig-colourppcheck) Posterior predictive checks of relative frequency of occurrence of each colour class per bottle type. Blue bars represent the observed proportions, black point is the mean predicted proportion and horizontal error bars depicts the Bayesian 95% credible intervals.
+
+```{r colourppcheck, fig.width = 7.9, fig.height = 5.1, fig.cap = "(ref:fig-colourppcheck)", cache = TRUE, dependson = "colourmodel"}
+
+pp_check(mod_colour, type = "bars_grouped", group = "type", size = 0.8,
+         fatten = 1, prob = 0.95, ndraws = 300, freq = FALSE) +
+  labs(x = "Colour", y = "Probability of microplastic particle") +
+  scale_fill_manual("", values ="lightblue", labels = "Empirical data") +
+  scale_colour_manual("", values ="black", labels = "Model predictions") +
+  ylim(c(0, 1)) +
+  scale_x_discrete(limits = as.character(1:10),
+                   labels = sort(unique(mp$colour))) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = -45, vjust = 0.5, hjust = 0),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"))
+```
+
+### {.toc-ignore .unnumbered .tabset .tabset-pills}
+
+**Calculating differences between bottle types**
+
+The code to calculate the differences is slightly more verbose than before, but here it is!
+
+```{r colourdiff, cache = TRUE, dependson = "colourmodel"}
+
+nd <- data.frame(colour = "blue", type = c("control", "treatment"))
+predictions <- posterior_epred(mod_colour, newdata = nd, re_formula = NA)
+posterior_diffs <- vector(mode = "list", length = 12)
+names(posterior_diffs) <- sort(unique(mp$colour))
+for (i in seq_len(dim(predictions)[3])) {
+  # control - treatment
+  # control / treatment
+  posterior_diffs[[i]] <- data.frame(
+    diff = predictions[, 1, i] - predictions[, 2, i],
+    ratio = predictions[, 1, i] / predictions[, 2, i]
+  )
+}
+posterior_diffs <- map_dfr(posterior_diffs, identity, .id = "colour")
+```
+
+Which can wrangle to transform into summary tables of differences between Control and Treatment:
+
+(ref:fig-colourdiffviza) Posterior distribution of differences in frequency of occurrence of microplastic colour class between Control and Treatment bottles. Reference line depicts the 0 reference.
+
+```{r colourdiffviza, fig.width = 7.9, fig.height = 5.1, fig.cap = "(ref:fig-colourdiffviza)", cache = TRUE, dependson = "colourdiff"}
+
+posterior_diffs %>%
+  group_by(colour) %>%
+  mean_hdci(diff)
+
+ggplot(data = posterior_diffs) +
+  stat_halfeye(mapping = aes(x = diff), alpha = 0.8, .width = c(.95, .5)) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Posterior difference (Control - Treatment)", y = "Density") +
+  theme_bw() +
+  facet_wrap(~ colour, scales = "free") +
+  theme(legend.position = "bottom")
+
+```
+
+Or ratios:
+
+(ref:fig-colourdiffvizb) Posterior distribution of ratios (fold change) in frequency of occurrence of microplastic colour class between Control and Treatment bottles. Reference line depicts the 1 reference. x axis spacing scales to the natural log.
+
+```{r colourdiffvizb, fig.width = 7.9, fig.height = 5.1, fig.cap = "(ref:fig-colourdiffvizb)", cache = TRUE, dependson = "colourdiff"}
+
+posterior_diffs %>%
+  group_by(colour) %>%
+  mean_hdci(ratio)
+
+ggplot(data = posterior_diffs) +
+  stat_halfeye(mapping = aes(x = ratio), alpha = 0.8, .width = c(.95, .5)) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  labs(x = "Posterior ratio (Control / Treatment)", y = "Density") +
+  theme_bw() +
+  scale_x_continuous(trans = "log") +
+  facet_wrap(~ colour, scales = "free") +
+  theme(legend.position = "bottom")
+
+
+```
+
+Which overall indicates that some colours exist at different proportions within each group of bottles, however note that the uncertainty is quite large!! The expectation is that the differences should be centred around 0, and the ratios around 1. The colour class which seems to be the very similar between bottle types is "...". A much larger sample size should converge to that outcome. Figuring out what that exact sample size is supposed to be would require a formal power analysis.
+
+We can also extract the posterior probability of the difference being less or larger than 0 (expectation is that they should be pretty similar, i.e. mean is around 0), e.g.
+
+```{r polydiffprobs, cache = TRUE, dependson = "polydiff"}
+
+posterior_diffs %>%
+  group_by(colour) %>%
+  summarise(prob_neg = sum(diff < 0) / n(), prob_pos = sum(diff > 0) / n())
+```
+```{r, results = "markup"}
+sessionInfo()
+```
